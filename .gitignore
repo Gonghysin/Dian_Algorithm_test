@@ -48,8 +48,21 @@ log/
 *.sqlite
 *.db
 
-# 模型文件和数据集（根据需要配置）
+# 先确保 models 目录可访问
+!task2/models/
+!task2/models/best_model.pth
+
+# 忽略所有 .pth 文件
 *.pth
+**/*.pth
+
+# 忽略特定模型文件夹
+task2/models/bert-base-chinese/
+task2/models/tokenizer/
+
+
+# 模型文件和数据集（根据需要配置）
+**/*.pth
 *.pt
 *.pkl
 *.h5
