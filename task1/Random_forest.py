@@ -437,6 +437,27 @@ def plot_confusion_matrix(confusion_matrix, labels):
     plt.ylabel('True Class')
     plt.show()
 
+def plot_feature_importance(feature_importance):
+    """绘制特征重要性条形图"""
+    features, importances = zip(*feature_importance)
+    
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(features, importances)
+    
+    # 添加数值标签
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.4f}',
+                ha='center', va='bottom')
+    
+    plt.title('Feature Importance in Random Forest')
+    plt.xlabel('Features')
+    plt.ylabel('Importance')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
     # 加载数据
     data = load_data('task1/iris_dataset/bezdekIris.data')
@@ -459,6 +480,9 @@ if __name__ == "__main__":
     print("\n特征重要性排序:")
     for feature, importance in feature_importance:
         print(f"{feature:12}: {importance:.4f}")
+    
+    # 绘制特征重要性图
+    plot_feature_importance(feature_importance)
     
     # 保存模型
     rf.save_model('task1/random_forest_model.pkl')
