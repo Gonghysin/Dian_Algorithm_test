@@ -104,43 +104,74 @@ class AnimeRatingPredictor(nn.Module):
             _fast_init=True
         )
         
-        # 冻结BERT底层参数，只训练上层
-        for param in list(self.bert.parameters())[:-4]:
+        # 冻结部分BERT参数
+        for param in list(self.bert.parameters())[:-6]:
             param.requires_grad = False
             
-        # 更简单的回归头，使用GELU激活
-        self.regressor = nn.Sequential(
-            nn.Dropout(0.5),  # 增加dropout率
-            nn.Linear(self.bert.config.hidden_size, 128),
-            nn.LayerNorm(128),  # 使用LayerNorm替代BatchNorm
-            nn.GELU(),  # 使用GELU激活函数
+        # 使用双输出头，一个预测评分范围，一个预测具体评分
+        self.shared_layers = nn.Sequential(
             nn.Dropout(0.5),
-            nn.Linear(128, 1)
+            nn.Linear(self.bert.config.hidden_size, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(0.4)
         )
+        
+        # 评分区间分类器(0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0)
+        self.classifier = nn.Linear(256, 5)
+        
+        # 具体评分回归器
+        self.regressor = nn.Linear(256, 1)
     
     def forward(self, input_ids, attention_mask):
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         cls_output = outputs.last_hidden_state[:, 0, :]
-        return torch.sigmoid(self.regressor(cls_output)).squeeze(-1)
+        
+        shared_features = self.shared_layers(cls_output)
+        
+        # 区间分类预测
+        logits = self.classifier(shared_features)
+        
+        # 回归预测（不使用sigmoid）
+        regression = self.regressor(shared_features).squeeze(-1)
+        
+        # 使用Tanh替代Sigmoid，更易于拟合两端的极值
+        regression = 0.5 * (torch.tanh(regression) + 1.0)
+        
+        return regression, logits
 
-class FocalMSELoss(nn.Module):
-    def __init__(self, low_rating_weight=2.0, gamma=2.0):
+# 组合损失函数
+class CombinedLoss(nn.Module):
+    def __init__(self, class_weight=0.3, focal_weight=2.0, gamma=1.0):
         super().__init__()
-        self.low_rating_weight = low_rating_weight
+        self.class_weight = class_weight
+        self.focal_weight = focal_weight
         self.gamma = gamma
+        self.ce_loss = nn.CrossEntropyLoss()
     
-    def forward(self, pred, target):
-        # 基础MSE
-        mse = (pred - target) ** 2
+    def forward(self, regression_pred, class_pred, target):
+        # 回归损失（MSE）
+        mse = (regression_pred - target) ** 2
         
-        # 给低评分样本加权
+        # 对低评分样本加权
         weights = torch.ones_like(target)
-        weights[target <= 0.3] = self.low_rating_weight
+        weights[target <= 0.3] = self.focal_weight
         
-        # 焦点损失调整 - 让模型更关注难例
+        # Focal loss调整
         difficult_factor = torch.exp(self.gamma * mse)
         
-        return (weights * difficult_factor * mse).mean()
+        # 计算分类目标
+        bins = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], device=target.device)
+        target_class = torch.bucketize(target, bins) - 1
+        
+        # 分类损失
+        cls_loss = self.ce_loss(class_pred, target_class)
+        
+        # 组合损失
+        reg_loss = (weights * difficult_factor * mse).mean()
+        combined_loss = reg_loss + self.class_weight * cls_loss
+        
+        return combined_loss, reg_loss, cls_loss
 
 def evaluate_model(model, data_loader, criterion, device):
     """评估模型"""
@@ -186,28 +217,27 @@ def evaluate_model(model, data_loader, criterion, device):
         'low_ratings_mse': low_ratings_mse
     }
 
-def train_model(model, train_loader, val_loader, epochs=12, device='cuda',
-                patience=4, weight_decay=0.03):
-    """训练模型"""
+def train_model(model, train_loader, val_loader, epochs=15, device='cuda',
+                patience=5, weight_decay=0.01):
     model = model.to(device)
     
-    # 使用修改后的损失函数
-    criterion = FocalMSELoss(low_rating_weight=2.5, gamma=1.0)
+    # 使用组合损失函数
+    criterion = CombinedLoss(class_weight=0.3, focal_weight=2.0, gamma=1.0)
     
-    # 使用不同的学习率
-    optimizer = AdamW(
-        [
-            {"params": model.bert.parameters(), "lr": 1e-5},  # BERT部分学习率低
-            {"params": model.regressor.parameters(), "lr": 5e-4}  # 回归头学习率高
-        ],
-        weight_decay=weight_decay
-    )
+    # 分层学习率
+    optimizer = AdamW([
+        {"params": model.bert.parameters(), "lr": 2e-5},
+        {"params": model.shared_layers.parameters(), "lr": 5e-4},
+        {"params": model.classifier.parameters(), "lr": 1e-3},
+        {"params": model.regressor.parameters(), "lr": 1e-3}
+    ], weight_decay=weight_decay)
     
-    # 使用One-Cycle学习率调度
+    # 学习率调度
+    total_steps = len(train_loader) * epochs
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=[1e-5, 5e-4],
-        total_steps=len(train_loader) * epochs,
+        max_lr=[2e-5, 5e-4, 1e-3, 1e-3],
+        total_steps=total_steps,
         pct_start=0.1
     )
     
@@ -442,9 +472,9 @@ if __name__ == "__main__":
         model,
         train_loader,
         val_loader,
-        epochs=12,
+        epochs=15,
         device=device,
-        patience=4,
-        weight_decay=0.03
+        patience=5,
+        weight_decay=0.01
     )
     test_tokenization()  # 添加这行
