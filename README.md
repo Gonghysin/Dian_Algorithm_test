@@ -23,9 +23,25 @@ pip install -r requirements.txt
 
 # 任务完成情况
 
-## Task1 随机森林鸢尾花分类
+## Task1 随机森林的理解与实现-鸢尾花分类
 
 详细完成路径，和输出结果见：[task1_doc.md](./task1/task1_doc.md)
 
 使用方法：运行./task1/Random_forest.py
 
+
+## Task2 Bangumi评论分数预测器的训练
+
+详细完成路径，和输出结果见：[task2_doc.md](./task2/task2_doc.md)
+
+项目文件结构：
+
+```bash
+task2/
+├── catch/ # 爬虫脚本
+├── dataset/ # 数据集
+├── dataset_proceed.py # 数据集处理脚本
+├── only_highdata_image.py # 数据集可视化脚本（单独用来可视化原数据集用的）
+├── task2_doc.md # 任务文档
+└── dataset_clear.py # 数据集清洗脚本
+```
