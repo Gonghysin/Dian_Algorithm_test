@@ -57,7 +57,7 @@ log/
 **/*.pth
 
 # 忽略特定模型文件夹
-task2/models/bert-base-chinese/
+
 task2/models/tokenizer/
 
 

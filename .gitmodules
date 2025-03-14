@@ -1,0 +1,3 @@
+[submodule "task2/models/bert-base-chinese"]
+    path = task2/models/bert-base-chinese
+    url = https://huggingface.co/google-bert/bert-base-chinese 
