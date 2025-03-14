@@ -132,11 +132,16 @@ class AnimeRatingPredictor(nn.Module):
         # 区间分类预测
         logits = self.classifier(shared_features)
         
-        # 回归预测（不使用sigmoid）
+        # 回归预测 - 扩大范围到[-0.2, 1.2]
         regression = self.regressor(shared_features).squeeze(-1)
         
-        # 使用Tanh替代Sigmoid，更易于拟合两端的极值
-        regression = 0.5 * (torch.tanh(regression) + 1.0)
+        # 使用Tanh但扩大范围为[-0.2, 1.2]
+        regression = 0.7 * (torch.tanh(regression) + 1.0) - 0.2
+        
+        # 在训练阶段保持扩展范围，不裁剪
+        # 在评估/预测时再裁剪到[0,1]范围
+        if not self.training:
+            regression = torch.clamp(regression, 0.0, 1.0)
         
         return regression, logits
 
@@ -150,8 +155,11 @@ class CombinedLoss(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss()
     
     def forward(self, regression_pred, class_pred, target):
+        # 计算MSE前先对预测值进行裁剪，避免负面惩罚超出范围的预测
+        clipped_pred = torch.clamp(regression_pred, 0.0, 1.0)
+        
         # 回归损失（MSE）
-        mse = (regression_pred - target) ** 2
+        mse = (clipped_pred - target) ** 2
         
         # 对低评分样本加权
         weights = torch.ones_like(target)
@@ -160,9 +168,13 @@ class CombinedLoss(nn.Module):
         # Focal loss调整
         difficult_factor = torch.exp(self.gamma * mse)
         
-        # 计算分类目标
-        bins = torch.tensor([0.0, 0.2, 0.4, 0.6, 0.8, 1.0], device=target.device)
-        target_class = torch.bucketize(target, bins) - 1
+        # 分类目标
+        target_class = torch.zeros_like(target, dtype=torch.long)
+        target_class[(target >= 0.0) & (target < 0.2)] = 0
+        target_class[(target >= 0.2) & (target < 0.4)] = 1
+        target_class[(target >= 0.4) & (target < 0.6)] = 2
+        target_class[(target >= 0.6) & (target < 0.8)] = 3
+        target_class[(target >= 0.8) & (target <= 1.0)] = 4
         
         # 分类损失
         cls_loss = self.ce_loss(class_pred, target_class)
@@ -187,11 +199,12 @@ def evaluate_model(model, data_loader, criterion, device):
             ratings = batch['rating'].to(device)
             
             with autocast():
-                outputs = model(input_ids, attention_mask)
-                loss = criterion(outputs, ratings)
+                regression, logits = model(input_ids, attention_mask)
+                # 使用组合损失函数
+                combined_loss, reg_loss, cls_loss = criterion(regression, logits, ratings)
             
-            total_loss += loss.item()
-            all_preds.extend(outputs.cpu().numpy())
+            total_loss += combined_loss.item()
+            all_preds.extend(regression.cpu().numpy())
             all_labels.extend(ratings.cpu().numpy())
     
     # 计算各种评估指标
@@ -274,16 +287,16 @@ def train_model(model, train_loader, val_loader, epochs=15, device='cuda',
             optimizer.zero_grad()
             
             with autocast():
-                outputs = model(input_ids, attention_mask)
-                loss = criterion(outputs, ratings)
+                regression, logits = model(input_ids, attention_mask)
+                combined_loss, reg_loss, cls_loss = criterion(regression, logits, ratings)
             
-            scaler.scale(loss).backward()
+            scaler.scale(combined_loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             
-            total_train_loss += loss.item()
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            total_train_loss += combined_loss.item()
+            train_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}'})
         
         # 收集验证集的预测结果
         model.eval()
@@ -294,8 +307,8 @@ def train_model(model, train_loader, val_loader, epochs=15, device='cuda',
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 ratings = batch['rating'].to(device)
-                outputs = model(input_ids, attention_mask)
-                val_preds.extend(outputs.cpu().numpy())
+                regression, _ = model(input_ids, attention_mask)
+                val_preds.extend(regression.cpu().numpy())
                 val_labels.extend(ratings.cpu().numpy())
         
         # 评估阶段
