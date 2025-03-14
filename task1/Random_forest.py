@@ -169,7 +169,8 @@ class RandomForest:
         self.min_samples = min_samples
         self.n_features = n_features
         self.trees = []
-        self.feature_names = None  # 添加特征名称存储
+        # 设置默认特征名称
+        self.feature_names = ['sepal_length', 'sepal_width', 'petal_length', 'petal_width']
 
     def bootstrap_sample(self, X, y):
         """Bootstrap采样：有放回地随机抽取样本"""
@@ -223,11 +224,9 @@ class RandomForest:
         print(f"- 最小样本数: {self.min_samples}")
         print(f"- 特征子集大小: {self.n_features}")
         
-        # 保存特征名称
+        # 如果输入是DataFrame，使用其列名
         if isinstance(X, pd.DataFrame):
             self.feature_names = X.columns.tolist()
-        else:
-            self.feature_names = [f"feature_{i}" for i in range(X.shape[1])]
         
         # 构建多棵决策树
         for i in tqdm(range(self.n_trees), desc="训练决策树"):
@@ -364,6 +363,70 @@ class RandomForest:
             'labels': unique_labels
         }
 
+    def feature_importance(self, X, y):
+        """
+        计算特征重要性
+        X: 用于计算特征重要性的数据
+        y: 对应的标签
+        """
+        importances = np.zeros(len(self.feature_names))
+        
+        # 收集所有树中每个特征的基尼指数减少量
+        for tree in self.trees:
+            def collect_gini_decrease(node, X_node, y_node):
+                if node.value is not None:  # 叶节点
+                    return
+                
+                # 计算当前节点的基尼指数减少量
+                feature = node.feature
+                
+                # 获取左右子节点的样本比例和基尼指数
+                left_mask = X_node[:, feature] <= node.threshold
+                right_mask = ~left_mask
+                
+                # 如果划分后的节点为空，则跳过
+                if np.sum(left_mask) == 0 or np.sum(right_mask) == 0:
+                    return
+                
+                n_left = np.sum(left_mask)
+                n_right = np.sum(right_mask)
+                n_total = n_left + n_right
+                
+                # 计算分裂前的基尼指数
+                gini_parent = tree.calculate_gini(y_node)
+                
+                # 计算分裂后的加权基尼指数
+                gini_left = tree.calculate_gini(y_node[left_mask])
+                gini_right = tree.calculate_gini(y_node[right_mask])
+                gini_children = (n_left * gini_left + n_right * gini_right) / n_total
+                
+                # 计算基尼指数减少量
+                gini_decrease = gini_parent - gini_children
+                importances[feature] += gini_decrease
+                
+                # 递归遍历子节点
+                collect_gini_decrease(node.left, X_node[left_mask], y_node[left_mask])
+                collect_gini_decrease(node.right, X_node[right_mask], y_node[right_mask])
+            
+            collect_gini_decrease(tree.tree, X, y)
+        
+        # 计算平均重要性并归一化
+        importances = importances / self.n_trees
+        if np.sum(importances) > 0:  # 避免除以0
+            importances = importances / np.sum(importances)
+        
+        # 创建特征重要性字典
+        importance_dict = dict(zip(self.feature_names, importances))
+        
+        # 按重要性降序排序
+        sorted_importance = sorted(
+            importance_dict.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        return sorted_importance
+
 def plot_confusion_matrix(confusion_matrix, labels):
     """绘制混淆矩阵热力图"""
     plt.figure(figsize=(10, 8))
@@ -385,28 +448,17 @@ if __name__ == "__main__":
     print("训练集大小:", X_train.shape)
     print("测试集大小:", X_test.shape)
     
-    # 测试特征选择
-    tree = DecisionTree()
-    X_train_np = X_train.to_numpy()
-    y_train_np = y_train.to_numpy()
-    
-    print("\n=== 开始特征选择测试 ===")
-    best_feature, best_threshold, best_gini = tree.find_best_split(X_train_np, y_train_np)
-    print("\n=== 特征选择结果汇总 ===")
-    print(f"最佳分裂特征: {X_train.columns[best_feature]}")
-    print(f"最佳分裂阈值: {best_threshold}")
-    print(f"最终基尼指数: {best_gini}")
-
-    # 训练决策树
-    print("\n=== 开始训练决策树 ===")
-    tree = DecisionTree(max_depth=5, min_samples=2)
-    tree.fit(X_train_np, y_train_np)
-    print("\n=== 决策树训练完成 ===")
-
     # 训练随机森林
     print("\n=== 开始随机森林训练 ===")
     rf = RandomForest(n_trees=100, max_depth=5, min_samples=2, n_features=2)
-    rf.fit(X_train_np, y_train_np)
+    rf.fit(X_train.values, y_train.values)
+    
+    # 计算并显示特征重要性
+    print("\n=== 特征重要性分析 ===")
+    feature_importance = rf.feature_importance(X_train.values, y_train.values)
+    print("\n特征重要性排序:")
+    for feature, importance in feature_importance:
+        print(f"{feature:12}: {importance:.4f}")
     
     # 保存模型
     rf.save_model('task1/random_forest_model.pkl')
