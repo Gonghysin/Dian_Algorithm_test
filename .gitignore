@@ -57,9 +57,10 @@ log/
 **/*.pth
 
 # 忽略特定模型文件夹
+task2/models/bert-base-chinese/**
 task2/models/bert-base-chinese/
 task2/models/tokenizer/
-
+!task2/models/best_model.pth
 
 # 模型文件和数据集（根据需要配置）
 **/*.pth
