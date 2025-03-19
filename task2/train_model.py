@@ -3,7 +3,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertModel, BertConfig, AdamW
 from tqdm import tqdm
+from transformers import BertTokenizer, BertModel, BertConfig, AdamW
+from tqdm import tqdm
 import torch.nn as nn
+import numpy as np
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.stats import spearmanr
@@ -34,6 +38,8 @@ def load_data(batch_size=32, sample_ratio=1.0):
     return train_loader, val_loader
 
 class AnimeDataset(Dataset):
+    """简化的数据集类"""
+    def __init__(self, comments, ratings, tokenizer, max_length=128):
     """简化的数据集类"""
     def __init__(self, comments, ratings, tokenizer, max_length=128):
         self.comments = comments
@@ -149,6 +155,7 @@ def train_and_evaluate(model, train_loader, val_loader, epochs=15, lr=2e-5,
         # 训练阶段
         model.train()
         total_loss = 0
+        total_loss = 0
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
         
         for batch in train_pbar:
@@ -161,7 +168,16 @@ def train_and_evaluate(model, train_loader, val_loader, epochs=15, lr=2e-5,
             loss = criterion(predictions, ratings)
             loss.backward()
             optimizer.step()
+            predictions = model(input_ids, attention_mask)
+            loss = criterion(predictions, ratings)
+            loss.backward()
+            optimizer.step()
             
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
             total_loss += loss.item()
             train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
@@ -169,7 +185,12 @@ def train_and_evaluate(model, train_loader, val_loader, epochs=15, lr=2e-5,
         train_losses.append(avg_train_loss)
         
         # 评估阶段
+        # 评估阶段
         model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        
         val_loss = 0
         all_preds = []
         all_labels = []
@@ -295,7 +316,7 @@ def plot_training_history(train_losses, val_losses, val_maes, val_spearmans,
         plt.axvline(x=best_epoch, color='r', linestyle='--', label='Best Model')
     plt.title('MSE over epochs')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE')
+    plt.ylabel('Loss/MSE')
     plt.legend()
     
     # 3. MAE和RMSE曲线
@@ -349,6 +370,7 @@ def plot_training_history(train_losses, val_losses, val_maes, val_spearmans,
     
     plt.tight_layout()
     plt.savefig('task2/models/simple_training_history.png')
+    plt.savefig('task2/models/simple_training_history.png')
     plt.close()
     print("训练历史图表已保存到 task2/models/simple_training_history.png")
 
@@ -358,7 +380,18 @@ if __name__ == "__main__":
     np.random.seed(42)
     
     # 设置设备
+    # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 用户选择
+    print("=" * 50)
+    print("简易动漫评论评分预测模型微调程序")
+    print("=" * 50)
+    
+    # 询问用户是否使用小数据集
+    use_small_dataset = input("是否使用5%的数据集进行快速训练？(y/n): ").lower() == 'y'
+    sample_ratio = 0.05 if use_small_dataset else 1.0
     print(f"使用设备: {device}")
     
     # 用户选择

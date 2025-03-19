@@ -61,6 +61,7 @@ task2/models/bert-base-chinese/**
 task2/models/bert-base-chinese/
 task2/models/tokenizer/
 !task2/models/best_model.pth
+!anime-rating-model/pytorch_model.bin
 
 # 忽略特定模型文件夹
 task2/models/bert-base-chinese/**

@@ -38,6 +38,14 @@
 
 训练集、验证集名称：train_set.csv、val_set.csv
 
+# 数据爬取
+// ... existing code ...
+
+# 数据清洗
+// ... existing code ...
+
+# 数据预处理
+// ... existing code ...
 
 # 模型微调
 对预训练的中文BERT模型（bert-base-chinese）进行微调训练，使用PyTorch实现了一个简易但高效的微调程序。
