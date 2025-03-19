@@ -1,25 +1,21 @@
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, BertConfig
-import os
-import torch.nn as nn
-from transformers import BertModel, AdamW, get_linear_schedule_with_warmup
+from transformers import BertTokenizer, BertModel, BertConfig, AdamW
 from tqdm import tqdm
-import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
-from scipy.stats import spearmanr
+import torch.nn as nn
 import numpy as np
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import time
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from scipy.stats import spearmanr
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
-import json
+import os
+
+# 确保模型保存目录存在
+os.makedirs('task2/models', exist_ok=True)
 
 class AnimeDataset(Dataset):
-    """自定义数据集类"""
-    def __init__(self, comments, ratings, tokenizer, max_length=512):
+    """简化的数据集类"""
+    def __init__(self, comments, ratings, tokenizer, max_length=128):
         self.comments = comments
         self.ratings = ratings
         self.tokenizer = tokenizer
@@ -32,7 +28,6 @@ class AnimeDataset(Dataset):
         comment = str(self.comments[idx])
         rating = self.ratings[idx]
 
-        # 使用tokenizer处理文本
         encoding = self.tokenizer(
             comment,
             add_special_tokens=True,
@@ -48,22 +43,50 @@ class AnimeDataset(Dataset):
             'rating': torch.tensor(rating, dtype=torch.float)
         }
 
-def load_data(batch_size=16):
+class SimpleRatingPredictor(nn.Module):
+    """简化的评分预测模型"""
+    def __init__(self, pretrained_model_path):
+        super().__init__()
+        config = BertConfig.from_json_file(f'{pretrained_model_path}/config.json')
+        self.bert = BertModel.from_pretrained(
+            pretrained_model_path,
+            config=config,
+            local_files_only=True
+        )
+        
+        # 简单的回归头
+        self.regressor = nn.Sequential(
+            nn.Dropout(0.1),
+            nn.Linear(self.bert.config.hidden_size, 1),
+            nn.Sigmoid()  # 确保输出在0-1范围内
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        return self.regressor(cls_output).squeeze(-1)
+
+def load_data(batch_size=32, sample_ratio=1.0):
     """加载数据集"""
-    print("开始加载数据...")
+    print("加载数据...")
     
     # 加载训练集和验证集
     train_df = pd.read_csv('task2/dataset/train_set.csv')
     val_df = pd.read_csv('task2/dataset/val_set.csv')
     
+    # 如果需要，进行采样
+    if sample_ratio < 1.0:
+        train_df = train_df.sample(frac=sample_ratio, random_state=42)
+        val_df = val_df.sample(frac=sample_ratio, random_state=42)
+        print(f"使用{sample_ratio*100:.1f}%的数据进行训练")
+    
     print(f"训练集大小: {len(train_df)}")
     print(f"验证集大小: {len(val_df)}")
     
     # 加载tokenizer
-    print("加载tokenizer...")
     tokenizer = BertTokenizer.from_pretrained('task2/models/bert-base-chinese')
     
-    # 创建数据集实例
+    # 创建数据集和数据加载器
     train_dataset = AnimeDataset(
         train_df['comment'].values,
         train_df['normalized_rating'].values,
@@ -76,207 +99,28 @@ def load_data(batch_size=16):
         tokenizer
     )
     
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False
-    )
-    
-    return train_loader, val_loader, tokenizer
+    return train_loader, val_loader
 
-class AnimeRatingPredictor(nn.Module):
-    def __init__(self, pretrained_model_path):
-        super().__init__()
-        config = BertConfig.from_json_file(f'{pretrained_model_path}/config.json')
-        self.bert = BertModel.from_pretrained(
-            pretrained_model_path,
-            config=config,
-            local_files_only=True,
-            use_safetensors=False,
-            from_tf=False,
-            _fast_init=True
-        )
-        
-        # 冻结部分BERT参数
-        for param in list(self.bert.parameters())[:-6]:
-            param.requires_grad = False
-            
-        # 使用双输出头，一个预测评分范围，一个预测具体评分
-        self.shared_layers = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(self.bert.config.hidden_size, 256),
-            nn.LayerNorm(256),
-            nn.GELU(),
-            nn.Dropout(0.4)
-        )
-        
-        # 评分区间分类器(0-0.2, 0.2-0.4, 0.4-0.6, 0.6-0.8, 0.8-1.0)
-        self.classifier = nn.Linear(256, 5)
-        
-        # 具体评分回归器
-        self.regressor = nn.Linear(256, 1)
-    
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        
-        shared_features = self.shared_layers(cls_output)
-        
-        # 区间分类预测
-        logits = self.classifier(shared_features)
-        
-        # 回归预测 - 扩大范围到[-0.2, 1.2]
-        regression = self.regressor(shared_features).squeeze(-1)
-        
-        # 使用Tanh但扩大范围为[-0.2, 1.2]
-        regression = 0.7 * (torch.tanh(regression) + 1.0) - 0.2
-        
-        # 在训练阶段保持扩展范围，不裁剪
-        # 在评估/预测时再裁剪到[0,1]范围
-        if not self.training:
-            regression = torch.clamp(regression, 0.0, 1.0)
-        
-        return regression, logits
-
-# 组合损失函数
-class CombinedLoss(nn.Module):
-    def __init__(self, class_weight=0.3, focal_weight=2.0, gamma=1.0):
-        super().__init__()
-        self.class_weight = class_weight
-        self.focal_weight = focal_weight
-        self.gamma = gamma
-        self.ce_loss = nn.CrossEntropyLoss()
-    
-    def forward(self, regression_pred, class_pred, target):
-        # 计算MSE前先对预测值进行裁剪，避免负面惩罚超出范围的预测
-        clipped_pred = torch.clamp(regression_pred, 0.0, 1.0)
-        
-        # 回归损失（MSE）
-        mse = (clipped_pred - target) ** 2
-        
-        # 对低评分样本加权
-        weights = torch.ones_like(target)
-        weights[target <= 0.3] = self.focal_weight
-        
-        # Focal loss调整
-        difficult_factor = torch.exp(self.gamma * mse)
-        
-        # 分类目标
-        target_class = torch.zeros_like(target, dtype=torch.long)
-        target_class[(target >= 0.0) & (target < 0.2)] = 0
-        target_class[(target >= 0.2) & (target < 0.4)] = 1
-        target_class[(target >= 0.4) & (target < 0.6)] = 2
-        target_class[(target >= 0.6) & (target < 0.8)] = 3
-        target_class[(target >= 0.8) & (target <= 1.0)] = 4
-        
-        # 分类损失
-        cls_loss = self.ce_loss(class_pred, target_class)
-        
-        # 组合损失
-        reg_loss = (weights * difficult_factor * mse).mean()
-        combined_loss = reg_loss + self.class_weight * cls_loss
-        
-        return combined_loss, reg_loss, cls_loss
-
-def evaluate_model(model, data_loader, criterion, device):
-    """评估模型"""
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in data_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            ratings = batch['rating'].to(device)
-            
-            with autocast():
-                regression, logits = model(input_ids, attention_mask)
-                # 使用组合损失函数
-                combined_loss, reg_loss, cls_loss = criterion(regression, logits, ratings)
-            
-            total_loss += combined_loss.item()
-            all_preds.extend(regression.cpu().numpy())
-            all_labels.extend(ratings.cpu().numpy())
-    
-    # 计算各种评估指标
-    mse = total_loss / len(data_loader)
-    mae = mean_absolute_error(all_labels, all_preds)
-    spearman_corr, _ = spearmanr(all_labels, all_preds)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(all_labels, all_preds)
-    
-    # 计算低分段（1-3分）的预测效果
-    low_ratings_mask = np.array(all_labels) <= 0.3
-    low_ratings_mse = mean_squared_error(
-        np.array(all_labels)[low_ratings_mask],
-        np.array(all_preds)[low_ratings_mask]
-    ) if any(low_ratings_mask) else float('inf')
-    
-    return {
-        'mse': mse,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
-        'spearman': spearman_corr,
-        'low_ratings_mse': low_ratings_mse
-    }
-
-def train_model(model, train_loader, val_loader, epochs=15, device='cuda',
-                patience=5, weight_decay=0.01):
+def train_and_evaluate(model, train_loader, val_loader, epochs=5, lr=2e-5, device='cuda'):
+    """训练和评估模型"""
     model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = AdamW(model.parameters(), lr=lr)
     
-    # 使用组合损失函数
-    criterion = CombinedLoss(class_weight=0.3, focal_weight=2.0, gamma=1.0)
-    
-    # 分层学习率
-    optimizer = AdamW([
-        {"params": model.bert.parameters(), "lr": 2e-5},
-        {"params": model.shared_layers.parameters(), "lr": 5e-4},
-        {"params": model.classifier.parameters(), "lr": 1e-3},
-        {"params": model.regressor.parameters(), "lr": 1e-3}
-    ], weight_decay=weight_decay)
-    
-    # 学习率调度
-    total_steps = len(train_loader) * epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=[2e-5, 5e-4, 1e-3, 1e-3],
-        total_steps=total_steps,
-        pct_start=0.1
-    )
-    
-    scaler = GradScaler()
-    
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_epoch = 0
+    # 记录训练过程
+    train_losses = []
+    val_losses = []
+    val_maes = []
+    val_spearmans = []
     
     print("开始训练...")
-    start_time = time.time()
-    
-    # 修改记录训练历史的指标名称，使其与evaluate_model返回的指标匹配
-    metrics_history = {
-        'train_mse': [], 'val_mse': [],
-        'train_rmse': [], 'val_rmse': [],
-        'train_mae': [], 'val_mae': [],
-        'train_r2': [], 'val_r2': [],
-        'train_spearman': [], 'val_spearman': [],
-        'train_low_ratings_mse': [], 'val_low_ratings_mse': []
-    }
-    
     for epoch in range(epochs):
         # 训练阶段
         model.train()
-        total_train_loss = 0
+        total_loss = 0
         train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
         
         for batch in train_pbar:
@@ -285,117 +129,181 @@ def train_model(model, train_loader, val_loader, epochs=15, device='cuda',
             ratings = batch['rating'].to(device)
             
             optimizer.zero_grad()
+            predictions = model(input_ids, attention_mask)
+            loss = criterion(predictions, ratings)
+            loss.backward()
+            optimizer.step()
             
-            with autocast():
-                regression, logits = model(input_ids, attention_mask)
-                combined_loss, reg_loss, cls_loss = criterion(regression, logits, ratings)
-            
-            scaler.scale(combined_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            
-            total_train_loss += combined_loss.item()
-            train_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}'})
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
-        # 收集验证集的预测结果
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 评估阶段
         model.eval()
-        val_labels = []
-        val_preds = []
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        
         with torch.no_grad():
             for batch in val_loader:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 ratings = batch['rating'].to(device)
-                regression, _ = model(input_ids, attention_mask)
-                val_preds.extend(regression.cpu().numpy())
-                val_labels.extend(ratings.cpu().numpy())
+                
+                predictions = model(input_ids, attention_mask)
+                loss = criterion(predictions, ratings)
+                val_loss += loss.item()
+                
+                all_preds.extend(predictions.cpu().numpy())
+                all_labels.extend(ratings.cpu().numpy())
+        
+        # 计算评估指标
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        mae = mean_absolute_error(all_labels, all_preds)
+        val_maes.append(mae)
+        
+        spearman, _ = spearmanr(all_labels, all_preds)
+        val_spearmans.append(spearman)
+        
+        # 打印评估结果
+        print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, MAE: {mae:.4f}, Spearman: {spearman:.4f}")
+    
+    # 保存最终模型
+    torch.save(model.state_dict(), 'task2/models/simple_model.pth')
+    print("模型已保存到 task2/models/simple_model.pth")
+    
+    # 绘制训练过程
+    plot_training_history(train_losses, val_losses, val_maes, val_spearmans)
+    
+    return model
+
+def train_and_evaluate(model, train_loader, val_loader, epochs=5, lr=2e-5, device='cuda'):
+    """训练和评估模型"""
+    model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = AdamW(model.parameters(), lr=lr)
+    
+    # 记录训练过程
+    train_losses = []
+    val_losses = []
+    val_maes = []
+    val_spearmans = []
+    val_mses = []  # 添加MSE记录
+    val_rmses = []  # 添加RMSE记录
+    
+    # 记录最后一轮的预测结果
+    final_preds = None
+    final_labels = None
+    
+    print("开始训练...")
+    for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        total_loss = 0
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
+        
+        for batch in train_pbar:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            ratings = batch['rating'].to(device)
+            
+            optimizer.zero_grad()
+            predictions = model(input_ids, attention_mask)
+            loss = criterion(predictions, ratings)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
         
         # 评估阶段
-        train_metrics = evaluate_model(model, train_loader, criterion, device)
-        val_metrics = evaluate_model(model, val_loader, criterion, device)
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
         
-        # 打印详细的评估指标
-        print(f'\nEpoch {epoch+1}:')
-        print(f'Training - MSE: {train_metrics["mse"]:.4f}, MAE: {train_metrics["mae"]:.4f}, '
-              f'Spearman: {train_metrics["spearman"]:.4f}, Low Ratings MSE: {train_metrics["low_ratings_mse"]:.4f}')
-        print(f'Validation - MSE: {val_metrics["mse"]:.4f}, MAE: {val_metrics["mae"]:.4f}, '
-              f'Spearman: {val_metrics["spearman"]:.4f}, Low Ratings MSE: {val_metrics["low_ratings_mse"]:.4f}')
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                ratings = batch['rating'].to(device)
+                
+                predictions = model(input_ids, attention_mask)
+                loss = criterion(predictions, ratings)
+                val_loss += loss.item()
+                
+                all_preds.extend(predictions.cpu().numpy())
+                all_labels.extend(ratings.cpu().numpy())
         
-        # 早停检查
-        if val_metrics['mse'] < best_val_loss:
-            best_val_loss = val_metrics['mse']
-            patience_counter = 0
-            best_epoch = epoch
-            
-            # 保存最佳模型
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-                'train_metrics': train_metrics,
-            }, 'task2/models/best_model.pth')
-            print(f'Best model saved with validation MSE: {best_val_loss:.4f}')
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f'\nEarly stopping triggered after epoch {epoch+1}')
-                break
+        # 保存最后一轮的预测结果
+        if epoch == epochs - 1:
+            final_preds = all_preds
+            final_labels = all_labels
         
-        # 记录指标
-        for metric in ['mse', 'rmse', 'mae', 'r2', 'spearman', 'low_ratings_mse']:
-            metrics_history[f'train_{metric}'].append(train_metrics[metric])
-            metrics_history[f'val_{metric}'].append(val_metrics[metric])
+        # 计算评估指标
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
         
-        # 每个epoch结束时绘制图表，使用收集到的验证集结果
-        plot_training_metrics(metrics_history, all_labels=val_labels, all_preds=val_preds)
+        # 计算MSE和RMSE
+        mse = mean_squared_error(all_labels, all_preds)
+        rmse = np.sqrt(mse)
+        val_mses.append(mse)
+        val_rmses.append(rmse)
         
-        # 在验证集上生成混淆矩阵（使用当前epoch的预测结果）
-        if epoch == best_epoch:
-            plot_confusion_matrix(
-                np.array(val_labels), 
-                np.array(val_preds),
-                'task2/models/confusion_matrix.png'
-            )
+        mae = mean_absolute_error(all_labels, all_preds)
+        val_maes.append(mae)
+        
+        spearman, _ = spearmanr(all_labels, all_preds)
+        val_spearmans.append(spearman)
+        
+        # 打印评估结果
+        print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"MSE: {mse:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}, Spearman: {spearman:.4f}")
     
-    training_time = time.time() - start_time
-    print(f'\nTraining completed in {training_time/60:.2f} minutes')
-    print(f'Best model was saved at epoch {best_epoch+1}')
+    # 保存最终模型
+    torch.save(model.state_dict(), 'task2/models/simple_model.pth')
+    print("模型已保存到 task2/models/simple_model.pth")
     
-    # 训练结束后保存完整的评估结果
-    final_results = {
-        'metrics_history': metrics_history,
-        'best_epoch': best_epoch,
-        'best_val_loss': best_val_loss,
-        'training_time': training_time,
-        'final_train_metrics': train_metrics,
-        'final_val_metrics': val_metrics
-    }
+    # 绘制训练过程
+    plot_training_history(train_losses, val_losses, val_maes, val_spearmans, val_mses, val_rmses, final_labels, final_preds)
     
-    with open('task2/models/training_results.json', 'w') as f:
-        json.dump(final_results, f, indent=4)
+    # 打印最终评估结果
+    print("\n最终评估结果:")
+    print(f"MSE: {val_mses[-1]:.4f}")
+    print(f"RMSE: {val_rmses[-1]:.4f}")
+    print(f"MAE: {val_maes[-1]:.4f}")
+    print(f"Spearman相关系数: {val_spearmans[-1]:.4f}")
+    
+    return model
 
-def plot_training_metrics(metrics_history, all_labels=None, all_preds=None):
-    """绘制训练过程中的指标变化"""
+def plot_training_history(train_losses, val_losses, val_maes, val_spearmans, val_mses, val_rmses, all_labels=None, all_preds=None):
+    """绘制更详细的训练历史图表"""
     plt.figure(figsize=(15, 10))
     
-    # 1. 损失曲线
+    # 1. MSE损失曲线
     plt.subplot(2, 2, 1)
-    plt.plot(metrics_history['train_mse'], label='Train MSE')
-    plt.plot(metrics_history['val_mse'], label='Val MSE')
-    plt.title('MSE Loss over epochs')
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.plot(val_mses, label='Val MSE')
+    plt.title('Loss and MSE over epochs')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE')
+    plt.ylabel('Loss/MSE')
     plt.legend()
     
-    # 2. MAE曲线
+    # 2. MAE和RMSE曲线
     plt.subplot(2, 2, 2)
-    plt.plot(metrics_history['train_mae'], label='Train MAE')
-    plt.plot(metrics_history['val_mae'], label='Val MAE')
-    plt.title('MAE over epochs')
+    plt.plot(val_maes, label='MAE')
+    plt.plot(val_rmses, label='RMSE')
+    plt.title('MAE and RMSE over epochs')
     plt.xlabel('Epoch')
-    plt.ylabel('MAE')
+    plt.ylabel('Error')
     plt.legend()
     
     # 3. 预测值vs真实值散点图
@@ -418,76 +326,204 @@ def plot_training_metrics(metrics_history, all_labels=None, all_preds=None):
         plt.legend()
     
     plt.tight_layout()
-    plt.savefig('task2/models/training_metrics.png')
+    plt.savefig('task2/models/simple_training_history.png')
     plt.close()
+    print("训练历史图表已保存到 task2/models/simple_training_history.png")
 
-def plot_confusion_matrix(true_ratings, pred_ratings, save_path):
-    """绘制评分区间混淆矩阵"""
-    # 将连续值转换为分类区间
-    bins = [0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    labels = ['1-2', '3-4', '5-6', '7-8', '9-10']
+def train_and_evaluate(model, train_loader, val_loader, epochs=5, lr=2e-5, device='cuda'):
+    """训练和评估模型"""
+    model = model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = AdamW(model.parameters(), lr=lr)
     
-    # 确保输入是numpy数组
-    true_ratings = np.array(true_ratings)
-    pred_ratings = np.array(pred_ratings)
+    # 记录训练过程
+    train_losses = []
+    val_losses = []
+    val_maes = []
+    val_spearmans = []
     
-    # 使用numpy的digitize函数进行分箱
-    true_bins = np.digitize(true_ratings, bins) - 1
-    pred_bins = np.digitize(pred_ratings, bins) - 1
+    # 记录最后一轮的预测结果
+    final_preds = None
+    final_labels = None
     
-    # 将超出范围的值限制在合法范围内
-    true_bins = np.clip(true_bins, 0, len(labels)-1)
-    pred_bins = np.clip(pred_bins, 0, len(labels)-1)
+    print("开始训练...")
+    for epoch in range(epochs):
+        # 训练阶段
+        model.train()
+        total_loss = 0
+        train_pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{epochs} [Train]')
+        
+        for batch in train_pbar:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            ratings = batch['rating'].to(device)
+            
+            optimizer.zero_grad()
+            predictions = model(input_ids, attention_mask)
+            loss = criterion(predictions, ratings)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # 评估阶段
+        model.eval()
+        val_loss = 0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                ratings = batch['rating'].to(device)
+                
+                predictions = model(input_ids, attention_mask)
+                loss = criterion(predictions, ratings)
+                val_loss += loss.item()
+                
+                all_preds.extend(predictions.cpu().numpy())
+                all_labels.extend(ratings.cpu().numpy())
+        
+        # 保存最后一轮的预测结果
+        if epoch == epochs - 1:
+            final_preds = all_preds
+            final_labels = all_labels
+        
+        # 计算评估指标
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        mae = mean_absolute_error(all_labels, all_preds)
+        val_maes.append(mae)
+        
+        spearman, _ = spearmanr(all_labels, all_preds)
+        val_spearmans.append(spearman)
+        
+        # 打印评估结果
+        print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, MAE: {mae:.4f}, Spearman: {spearman:.4f}")
     
-    # 计算混淆矩阵
-    cm = confusion_matrix(true_bins, pred_bins, labels=range(len(labels)))
+    # 保存最终模型
+    torch.save(model.state_dict(), 'task2/models/simple_model.pth')
+    print("模型已保存到 task2/models/simple_model.pth")
     
-    # 绘制热力图
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', xticklabels=labels, yticklabels=labels)
-    plt.title('Rating Range Confusion Matrix')
-    plt.xlabel('Predicted Rating')
-    plt.ylabel('True Rating')
-    plt.savefig(save_path)
-    plt.close()
-
-def test_tokenization():
-    """测试分词效果"""
-    tokenizer = BertTokenizer.from_pretrained('task2/models/bert-base-chinese')
+    # 绘制训练过程
+    plot_training_history(train_losses, val_losses, val_maes, val_spearmans, final_labels, final_preds)
     
-    # 测试样例
-    sample_text = "白开水"
-    tokens = tokenizer.tokenize(sample_text)
-    token_ids = tokenizer.encode(sample_text)
-    
-    print(f"原文: {sample_text}")
-    print(f"分词结果: {tokens}")
-    print(f"Token IDs: {token_ids}")
-    print(f"解码结果: {tokenizer.decode(token_ids)}")
+    return model
 
 if __name__ == "__main__":
     # 设置随机种子
     torch.manual_seed(42)
     np.random.seed(42)
     
-    # 设置设备和batch size
+    # 设置设备
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 64
+    print(f"使用设备: {device}")
+    
+    # 用户选择
+    print("=" * 50)
+    print("简易动漫评论评分预测模型微调程序")
+    print("=" * 50)
+    
+    # 询问用户是否使用小数据集
+    use_small_dataset = input("是否使用5%的数据集进行快速训练？(y/n): ").lower() == 'y'
+    sample_ratio = 0.05 if use_small_dataset else 1.0
     
     # 加载数据
-    train_loader, val_loader, tokenizer = load_data(batch_size=batch_size)
+    train_loader, val_loader = load_data(batch_size=32, sample_ratio=sample_ratio)
     
     # 初始化模型
-    model = AnimeRatingPredictor('task2/models/bert-base-chinese')
+    model = SimpleRatingPredictor('task2/models/bert-base-chinese')
+    
+    # 训练模型 - 统一使用5轮训练
+    epochs = 5
+    model = train_and_evaluate(model, train_loader, val_loader, epochs=epochs, device=device)
+    
+    # 测试预测
+    tokenizer = BertTokenizer.from_pretrained('task2/models/bert-base-chinese')
+    
+    test_comments = [
+        "这部动漫太棒了，情节紧凑，人物刻画深入，强烈推荐！",
+        "剧情一般，画风还可以，打发时间可以看看。",
+        "太难看了，浪费时间，剧情混乱，角色塑造差。"
+    ]
+    
+    print("\n测试预测结果:")
+    for comment in test_comments:
+        rating = predict_rating(model, comment, tokenizer, device)
+        print(f"评论: {comment}")
+        print(f"预测评分: {rating:.1f}/10\n")
+    
+    print("简易微调程序执行完毕!")
+
+def predict_rating(model, text, tokenizer, device='cuda'):
+    """使用模型预测单个评论的评分"""
+    model.eval()
+    encoding = tokenizer(
+        text,
+        add_special_tokens=True,
+        max_length=128,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    )
+    
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+    
+    with torch.no_grad():
+        prediction = model(input_ids, attention_mask)
+    
+    # 将0-1的预测值转换为1-10的评分
+    rating = prediction.item() * 10
+    return rating
+
+if __name__ == "__main__":
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 用户选择
+    print("=" * 50)
+    print("简易动漫评论评分预测模型微调程序")
+    print("=" * 50)
+    
+    # 询问用户是否使用小数据集
+    use_small_dataset = input("是否使用5%的数据集进行快速训练？(y/n): ").lower() == 'y'
+    sample_ratio = 0.05 if use_small_dataset else 1.0
+    
+    # 加载数据
+    train_loader, val_loader = load_data(batch_size=32, sample_ratio=sample_ratio)
+    
+    # 初始化模型
+    model = SimpleRatingPredictor('task2/models/bert-base-chinese')
     
     # 训练模型
-    train_model(
-        model,
-        train_loader,
-        val_loader,
-        epochs=15,
-        device=device,
-        patience=5,
-        weight_decay=0.01
-    )
-    test_tokenization()  # 添加这行
+    epochs = 3 if use_small_dataset else 5
+    model = train_and_evaluate(model, train_loader, val_loader, epochs=epochs, device=device)
+    
+    # 测试预测
+    tokenizer = BertTokenizer.from_pretrained('task2/models/bert-base-chinese')
+    
+    test_comments = [
+        "这部动漫太棒了，情节紧凑，人物刻画深入，强烈推荐！",
+        "剧情一般，画风还可以，打发时间可以看看。",
+        "太难看了，浪费时间，剧情混乱，角色塑造差。"
+    ]
+    
+    print("\n测试预测结果:")
+    for comment in test_comments:
+        rating = predict_rating(model, comment, tokenizer, device)
+        print(f"评论: {comment}")
+        print(f"预测评分: {rating:.1f}/10\n")
+    
+    print("简易微调程序执行完毕!")
