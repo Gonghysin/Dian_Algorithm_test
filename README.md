@@ -43,5 +43,15 @@ task2/
 ├── dataset_proceed.py # 数据集处理脚本
 ├── only_highdata_image.py # 数据集可视化脚本（单独用来可视化原数据集用的）
 ├── task2_doc.md # 任务文档
+├── train_model.py # 训练模型脚本
 └── dataset_clear.py # 数据集清洗脚本
 ```
+
+
+模型已上传到HuggingFace
+地址：https://huggingface.co/titicacine/chinese-text-rating-model
+内附有使用方法
+
+## Task3 注意⼒机制及其变体的理解与实现
+
+详细完成路径见:[任务三完成结果](./task3/task3_doc.md)
